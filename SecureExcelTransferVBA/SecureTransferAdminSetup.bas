@@ -8,9 +8,12 @@ Option Explicit
 Private Const ADMIN_CONFIG_SHEET As String = "_SecureTransferConfig"
 Private Const ADMIN_AUDIT_SHEET As String = "_SecureTransferAudit"
 Private Const ADMIN_HOME_SHEET As String = "Secure Transfer"
-Private Const ADMIN_SCHEMA_VERSION As String = "1"
+Private Const ADMIN_SCHEMA_VERSION As String = "2"
 Private Const ADMIN_STATE_SEALED As String = "SEALED"
 Private Const ADMIN_APPROVED As String = "APPROVED"
+Private Const ADMIN_EXPORT_DISABLED As String = "DISABLED"
+Private Const ADMIN_EXPORT_HTML As String = "HTML"
+Private Const ADMIN_EXPORT_PDF As String = "PDF"
 Private Const ADMIN_DIALOG_FOLDER_PICKER As Long = 4
 Private Const ADMIN_SHAPE_ROUNDED_RECTANGLE As Long = 5
 Private Const ADMIN_ERR_CANCELLED_OFFSET As Long = 7201
@@ -21,6 +24,9 @@ Public Sub SecureTransfer_AdminInitialize()
     Dim approvedWorkbook As String
     Dim approvedBy As String
     Dim approvalExpiry As String
+    Dim exportApprovalStatus As String
+    Dim allowedExportRoot As String
+    Dim allowedExportFormats As String
     Dim maxRows As Long
     Dim maxColumns As Long
     Dim maxCells As Long
@@ -82,7 +88,8 @@ Public Sub SecureTransfer_AdminInitialize()
 
     AdminRejectIfOfficeRightsManaged
 
-    allowedRoot = AdminSelectFolder(ThisWorkbook.Path)
+    allowedRoot = AdminSelectFolder( _
+        ThisWorkbook.Path, "가져오기 원본과 대상에 대해 승인된 루트 폴더 선택")
     If Len(allowedRoot) = 0 Then AdminRaiseCancelled
     allowedRoot = AdminNormalizeExistingFolder(allowedRoot)
     approvedWorkbook = AdminNormalizeExistingFile(ThisWorkbook.FullName)
@@ -102,6 +109,29 @@ Public Sub SecureTransfer_AdminInitialize()
     Call AdminParseIsoDate(approvalExpiry)
     If AdminParseIsoDate(approvalExpiry) < Date Then
         AdminRaiseSetup "승인 만료일은 오늘 이후여야 합니다."
+    End If
+
+    exportApprovalStatus = ADMIN_EXPORT_DISABLED
+    allowedExportRoot = vbNullString
+    allowedExportFormats = vbNullString
+
+    If MsgBox( _
+        "보안팀이 이 통합문서의 선택 범위를 평문 HTML 또는 PDF로 " & _
+        "내보내는 업무를 명시적으로 승인했습니까?" & vbCrLf & vbCrLf & _
+        "승인 티켓에 출력 폴더, 허용 형식, 데이터 범위가 포함된 경우에만 [예]를 누르세요.", _
+        vbExclamation + vbYesNo + vbDefaultButton2, _
+        "Secure Excel Transfer - 내보내기 승인") = vbYes Then
+
+        exportApprovalStatus = ADMIN_APPROVED
+        allowedExportRoot = AdminSelectFolder( _
+            allowedRoot, "보안팀이 승인한 HTML/PDF 출력 폴더 선택")
+        If Len(allowedExportRoot) = 0 Then AdminRaiseCancelled
+        allowedExportRoot = AdminNormalizeExistingFolder(allowedExportRoot)
+
+        allowedExportFormats = AdminPromptText( _
+            "보안팀이 승인한 형식을 입력하세요: HTML, PDF 또는 HTML,PDF", _
+            "Secure Excel Transfer - 허용 내보내기 형식", "HTML,PDF")
+        allowedExportFormats = AdminNormalizeExportFormats(allowedExportFormats)
     End If
 
     maxRows = 100000
@@ -170,6 +200,9 @@ Public Sub SecureTransfer_AdminInitialize()
     cfg.Add "ApprovedWorkbookFullName", approvedWorkbook
     cfg.Add "ApprovedBy", approvedBy
     cfg.Add "ApprovalExpiry", approvalExpiry
+    cfg.Add "ExportApprovalStatus", exportApprovalStatus
+    cfg.Add "AllowedExportRoot", allowedExportRoot
+    cfg.Add "AllowedExportFormats", allowedExportFormats
     cfg.Add "MaxRows", maxRows
     cfg.Add "MaxColumns", maxColumns
     cfg.Add "MaxCells", maxCells
@@ -228,7 +261,7 @@ Public Sub SecureTransfer_AdminInitialize()
         "1) 이 SecureTransferAdminSetup 모듈을 VBA 프로젝트에서 제거" & vbCrLf & _
         "2) 조직 코드서명 인증서로 VBA 프로젝트 서명" & vbCrLf & _
         "3) 서명된 매크로만 허용하는 정책과 승인 폴더 ACL 적용" & vbCrLf & _
-        "4) 파일을 닫았다가 다시 열어 시작 화면의 큰 버튼 확인", _
+        "4) 파일을 닫았다가 다시 열어 시작 화면의 가져오기·내보내기 버튼 확인", _
         vbInformation, "Secure Excel Transfer - 초기화 완료"
     Exit Sub
 
@@ -260,6 +293,11 @@ End Sub
 
 Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Object)
     Dim targetShape As Shape
+    Dim htmlExportApproved As Boolean
+    Dim pdfExportApproved As Boolean
+
+    htmlExportApproved = AdminExportFormatIsApproved(cfg, ADMIN_EXPORT_HTML)
+    pdfExportApproved = AdminExportFormatIsApproved(cfg, ADMIN_EXPORT_PDF)
 
     With homeSheet
         .Cells.Clear
@@ -273,11 +311,13 @@ Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Obj
         .Columns("C:D").ColumnWidth = 22
         .Columns("E:F").ColumnWidth = 18
         .Columns("G").ColumnWidth = 3
-        .Rows("1:22").RowHeight = 24
+        .Rows("1:28").RowHeight = 24
         .Rows("2:3").RowHeight = 32
+        .Rows("5").RowHeight = 36
         .Rows("7:9").RowHeight = 30
-        .Range("A1:G22").Font.Name = "맑은 고딕"
-        .Range("A1:G22").Interior.Color = RGB(245, 247, 250)
+        .Rows("21:23").RowHeight = 30
+        .Range("A1:G28").Font.Name = "맑은 고딕"
+        .Range("A1:G28").Interior.Color = RGB(245, 247, 250)
 
         .Range("B2:F3").Merge
         .Range("B2").Value2 = "Secure Excel Transfer"
@@ -288,10 +328,11 @@ Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Obj
         .Range("B2").VerticalAlignment = xlCenter
 
         .Range("B5:F5").Merge
-        .Range("B5").Value2 = "승인된 파일을 세 단계로 안전하게 가져옵니다."
+        .Range("B5").Value2 = "승인된 파일을 가져오고 승인된 범위를 안전하게 내보냅니다."
         .Range("B5").Font.Size = 12
         .Range("B5").Font.Color = RGB(89, 89, 89)
         .Range("B5").HorizontalAlignment = xlCenter
+        .Range("B5").WrapText = True
 
         AdminAddHomeButton homeSheet, "btnSecureImport", .Range("B7:F9"), _
             "파일 선택하고 가져오기", "SecureTransfer_ImportApprovedFile", _
@@ -321,7 +362,7 @@ Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Obj
         .Range("B14").Value2 = "승인 상태"
         .Range("B15").Value2 = "승인자/티켓"
         .Range("B16").Value2 = "승인 만료일"
-        .Range("B17").Value2 = "승인 폴더"
+        .Range("B17").Value2 = "가져오기 폴더"
         .Range("B18").Value2 = "최근 실행"
         .Range("B14:B18").Font.Bold = True
         .Range("B14:B18").Interior.Color = RGB(221, 235, 247)
@@ -337,13 +378,47 @@ Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Obj
         .Range("C14:F18").WrapText = True
 
         .Range("B20:F20").Merge
-        .Range("B20").Value2 = _
-            "정책 또는 권한 오류가 나오면 우회하지 말고 IT 보안팀에 문의하세요."
-        .Range("B20").Font.Size = 10
-        .Range("B20").Font.Color = RGB(127, 127, 127)
+        .Range("B20").Value2 = "승인된 선택 범위 내보내기"
+        .Range("B20").Font.Bold = True
+        .Range("B20").Font.Color = RGB(255, 255, 255)
+        .Range("B20").Interior.Color = RGB(68, 114, 196)
         .Range("B20").HorizontalAlignment = xlCenter
 
-        .Range("B2:F20").VerticalAlignment = xlVAlignCenter
+        If htmlExportApproved Then
+            AdminAddHomeButton homeSheet, "btnExportHtml", .Range("B21:D23"), _
+                "선택 범위 → HTML", "SecureTransfer_ExportSelectedRangeHtml", _
+                RGB(0, 120, 167), RGB(255, 255, 255), 13
+        Else
+            AdminAddHomeButton homeSheet, "btnExportHtml", .Range("B21:D23"), _
+                "HTML 내보내기 (미승인)", "SecureTransfer_ExportSelectedRangeHtml", _
+                RGB(166, 166, 166), RGB(255, 255, 255), 11
+        End If
+
+        If pdfExportApproved Then
+            AdminAddHomeButton homeSheet, "btnExportPdf", .Range("E21:F23"), _
+                "선택 범위 → PDF", "SecureTransfer_ExportSelectedRangePdf", _
+                RGB(192, 0, 0), RGB(255, 255, 255), 12
+        Else
+            AdminAddHomeButton homeSheet, "btnExportPdf", .Range("E21:F23"), _
+                "PDF 내보내기 (미승인)", "SecureTransfer_ExportSelectedRangePdf", _
+                RGB(166, 166, 166), RGB(255, 255, 255), 10
+        End If
+
+        .Range("B25:F25").Merge
+        .Range("B25").Value2 = _
+            "내보내기는 표시값만 생성하며 기존 파일을 덮어쓰지 않습니다."
+        .Range("B25").Font.Size = 10
+        .Range("B25").Font.Color = RGB(89, 89, 89)
+        .Range("B25").HorizontalAlignment = xlCenter
+
+        .Range("B27:F27").Merge
+        .Range("B27").Value2 = _
+            "정책 또는 권한 오류가 나오면 우회하지 말고 IT 보안팀에 문의하세요."
+        .Range("B27").Font.Size = 10
+        .Range("B27").Font.Color = RGB(127, 127, 127)
+        .Range("B27").HorizontalAlignment = xlCenter
+
+        .Range("B2:F27").VerticalAlignment = xlVAlignCenter
     End With
 End Sub
 
@@ -405,6 +480,9 @@ Private Sub AdminWriteConfiguration(ByVal configSheet As Worksheet, ByVal cfg As
         AdminWriteSetting configSheet, rowNumber, "ApprovedWorkbookFullName", cfg("ApprovedWorkbookFullName")
         AdminWriteSetting configSheet, rowNumber, "ApprovedBy", cfg("ApprovedBy")
         AdminWriteSetting configSheet, rowNumber, "ApprovalExpiry", cfg("ApprovalExpiry")
+        AdminWriteSetting configSheet, rowNumber, "ExportApprovalStatus", cfg("ExportApprovalStatus")
+        AdminWriteSetting configSheet, rowNumber, "AllowedExportRoot", cfg("AllowedExportRoot")
+        AdminWriteSetting configSheet, rowNumber, "AllowedExportFormats", cfg("AllowedExportFormats")
         AdminWriteSetting configSheet, rowNumber, "MaxRows", cfg("MaxRows")
         AdminWriteSetting configSheet, rowNumber, "MaxColumns", cfg("MaxColumns")
         AdminWriteSetting configSheet, rowNumber, "MaxCells", cfg("MaxCells")
@@ -444,12 +522,13 @@ Private Sub AdminPrepareAuditSheet(ByVal auditSheet As Worksheet)
     End With
 End Sub
 
-Private Function AdminSelectFolder(ByVal initialFolder As String) As String
+Private Function AdminSelectFolder(ByVal initialFolder As String, _
+                                   ByVal dialogTitle As String) As String
     Dim picker As Object
 
     Set picker = Application.FileDialog(ADMIN_DIALOG_FOLDER_PICKER)
     With picker
-        .Title = "보안팀이 승인한 루트 폴더 선택"
+        .Title = dialogTitle
         .AllowMultiSelect = False
         .InitialFileName = initialFolder
         If .Show <> -1 Then
@@ -466,7 +545,9 @@ Private Function AdminPromptText(ByVal promptText As String, _
     Dim response As Variant
 
     response = Application.InputBox(promptText, titleText, defaultText, Type:=2)
-    If VarType(response) = vbBoolean And response = False Then AdminRaiseCancelled
+    If VarType(response) = vbBoolean Then
+        If response = False Then AdminRaiseCancelled
+    End If
 
     AdminPromptText = Trim$(CStr(response))
     If Len(AdminPromptText) = 0 Then AdminRaiseSetup "입력값이 비어 있습니다."
@@ -481,7 +562,9 @@ Private Function AdminPromptLong(ByVal promptText As String, _
     Dim numericValue As Double
 
     response = Application.InputBox(promptText, titleText, defaultValue, Type:=1)
-    If VarType(response) = vbBoolean And response = False Then AdminRaiseCancelled
+    If VarType(response) = vbBoolean Then
+        If response = False Then AdminRaiseCancelled
+    End If
 
     numericValue = CDbl(response)
     If numericValue <> Fix(numericValue) Or _
@@ -491,6 +574,59 @@ Private Function AdminPromptLong(ByVal promptText As String, _
     End If
 
     AdminPromptLong = CLng(numericValue)
+End Function
+
+Private Function AdminNormalizeExportFormats(ByVal rawFormats As String) As String
+    Dim compactFormats As String
+    Dim parts As Variant
+    Dim partIndex As Long
+    Dim hasHtml As Boolean
+    Dim hasPdf As Boolean
+
+    compactFormats = UCase$(Trim$(rawFormats))
+    compactFormats = Replace(compactFormats, " ", vbNullString)
+    compactFormats = Replace(compactFormats, vbTab, vbNullString)
+
+    If Len(compactFormats) = 0 Or _
+       InStr(1, compactFormats, vbCr, vbBinaryCompare) > 0 Or _
+       InStr(1, compactFormats, vbLf, vbBinaryCompare) > 0 Then
+        AdminRaiseSetup "허용 내보내기 형식이 비어 있거나 올바르지 않습니다."
+    End If
+
+    parts = Split(compactFormats, ",")
+    For partIndex = LBound(parts) To UBound(parts)
+        Select Case CStr(parts(partIndex))
+            Case ADMIN_EXPORT_HTML
+                If hasHtml Then AdminRaiseSetup "허용 내보내기 형식에 HTML이 중복되었습니다."
+                hasHtml = True
+            Case ADMIN_EXPORT_PDF
+                If hasPdf Then AdminRaiseSetup "허용 내보내기 형식에 PDF가 중복되었습니다."
+                hasPdf = True
+            Case Else
+                AdminRaiseSetup "허용 내보내기 형식은 HTML과 PDF만 사용할 수 있습니다."
+        End Select
+    Next partIndex
+
+    If hasHtml And hasPdf Then
+        AdminNormalizeExportFormats = ADMIN_EXPORT_HTML & "," & ADMIN_EXPORT_PDF
+    ElseIf hasHtml Then
+        AdminNormalizeExportFormats = ADMIN_EXPORT_HTML
+    ElseIf hasPdf Then
+        AdminNormalizeExportFormats = ADMIN_EXPORT_PDF
+    Else
+        AdminRaiseSetup "허용된 내보내기 형식이 없습니다."
+    End If
+End Function
+
+Private Function AdminExportFormatIsApproved(ByVal cfg As Object, _
+                                             ByVal exportFormat As String) As Boolean
+    Dim allowedFormats As String
+
+    If UCase$(Trim$(CStr(cfg("ExportApprovalStatus")))) <> ADMIN_APPROVED Then Exit Function
+    allowedFormats = AdminNormalizeExportFormats(CStr(cfg("AllowedExportFormats")))
+    AdminExportFormatIsApproved = _
+        (InStr(1, "," & allowedFormats & ",", _
+               "," & exportFormat & ",", vbBinaryCompare) > 0)
 End Function
 
 Private Function AdminSheetExists(ByVal sheetName As String) As Boolean
@@ -597,6 +733,9 @@ Private Function AdminCanonicalConfig(ByVal cfg As Object) As String
         "ApprovedWorkbookFullName=" & CStr(cfg("ApprovedWorkbookFullName")) & vbLf & _
         "ApprovedBy=" & CStr(cfg("ApprovedBy")) & vbLf & _
         "ApprovalExpiry=" & CStr(cfg("ApprovalExpiry")) & vbLf & _
+        "ExportApprovalStatus=" & CStr(cfg("ExportApprovalStatus")) & vbLf & _
+        "AllowedExportRoot=" & CStr(cfg("AllowedExportRoot")) & vbLf & _
+        "AllowedExportFormats=" & CStr(cfg("AllowedExportFormats")) & vbLf & _
         "MaxRows=" & CStr(cfg("MaxRows")) & vbLf & _
         "MaxColumns=" & CStr(cfg("MaxColumns")) & vbLf & _
         "MaxCells=" & CStr(cfg("MaxCells")) & vbLf & _
