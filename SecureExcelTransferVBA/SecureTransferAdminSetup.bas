@@ -7,10 +7,12 @@ Option Explicit
 
 Private Const ADMIN_CONFIG_SHEET As String = "_SecureTransferConfig"
 Private Const ADMIN_AUDIT_SHEET As String = "_SecureTransferAudit"
+Private Const ADMIN_HOME_SHEET As String = "Secure Transfer"
 Private Const ADMIN_SCHEMA_VERSION As String = "1"
 Private Const ADMIN_STATE_SEALED As String = "SEALED"
 Private Const ADMIN_APPROVED As String = "APPROVED"
 Private Const ADMIN_DIALOG_FOLDER_PICKER As Long = 4
+Private Const ADMIN_SHAPE_ROUNDED_RECTANGLE As Long = 5
 Private Const ADMIN_ERR_CANCELLED_OFFSET As Long = 7201
 Private Const ADMIN_ERR_SETUP_OFFSET As Long = 7202
 
@@ -27,8 +29,10 @@ Public Sub SecureTransfer_AdminInitialize()
     Dim protectionPassword As String
     Dim passwordConfirmation As String
     Dim cfg As Object
+    Dim homeSheet As Worksheet
     Dim configSheet As Worksheet
     Dim auditSheet As Worksheet
+    Dim homeCreated As Boolean
     Dim configCreated As Boolean
     Dim auditCreated As Boolean
     Dim structureProtected As Boolean
@@ -70,8 +74,10 @@ Public Sub SecureTransfer_AdminInitialize()
         AdminRaiseSetup "통합문서 구조가 이미 보호되어 있습니다. 새 배포 사본에서 초기화하세요."
     End If
 
-    If AdminSheetExists(ADMIN_CONFIG_SHEET) Or AdminSheetExists(ADMIN_AUDIT_SHEET) Then
-        AdminRaiseSetup "기존 승인 설정 또는 감사 로그 시트가 있습니다. 덮어쓰지 않고 중단했습니다."
+    If AdminSheetExists(ADMIN_HOME_SHEET) Or _
+       AdminSheetExists(ADMIN_CONFIG_SHEET) Or _
+       AdminSheetExists(ADMIN_AUDIT_SHEET) Then
+        AdminRaiseSetup "기존 시작 화면, 승인 설정 또는 감사 로그 시트가 있습니다. 덮어쓰지 않고 중단했습니다."
     End If
 
     AdminRejectIfOfficeRightsManaged
@@ -98,25 +104,39 @@ Public Sub SecureTransfer_AdminInitialize()
         AdminRaiseSetup "승인 만료일은 오늘 이후여야 합니다."
     End If
 
-    maxRows = AdminPromptLong( _
-        "한 번에 허용할 최대 행 수를 입력하세요.", _
-        "Secure Excel Transfer - 최대 행", 100000, 1, 1048576)
+    maxRows = 100000
+    maxColumns = 256
+    maxCells = 500000
+    maxFileMB = 25
+    csvCharset = "utf-8"
 
-    maxColumns = AdminPromptLong( _
-        "한 번에 허용할 최대 열 수를 입력하세요.", _
-        "Secure Excel Transfer - 최대 열", 256, 1, 16384)
+    If MsgBox( _
+        "권장 기본값을 사용하면 추가 입력 없이 진행됩니다." & vbCrLf & vbCrLf & _
+        "최대 100,000행 / 256열 / 500,000셀 / 25MB / UTF-8" & vbCrLf & _
+        "처리 한도나 CSV 인코딩을 직접 바꾸시겠습니까?", _
+        vbQuestion + vbYesNo + vbDefaultButton2, _
+        "Secure Excel Transfer - 고급 설정") = vbYes Then
 
-    maxCells = AdminPromptLong( _
-        "한 번에 허용할 최대 전체 셀 수를 입력하세요.", _
-        "Secure Excel Transfer - 최대 셀", 500000, 1, 10000000)
+        maxRows = AdminPromptLong( _
+            "한 번에 허용할 최대 행 수를 입력하세요.", _
+            "Secure Excel Transfer - 최대 행", maxRows, 1, 1048576)
 
-    maxFileMB = AdminPromptLong( _
-        "허용할 최대 원본 파일 크기(MB)를 입력하세요.", _
-        "Secure Excel Transfer - 최대 파일 크기", 25, 1, 1024)
+        maxColumns = AdminPromptLong( _
+            "한 번에 허용할 최대 열 수를 입력하세요.", _
+            "Secure Excel Transfer - 최대 열", maxColumns, 1, 16384)
 
-    csvCharset = LCase$(AdminPromptText( _
-        "CSV 인코딩을 입력하세요: utf-8, ks_c_5601-1987(CP949 계열), windows-1252", _
-        "Secure Excel Transfer - CSV 인코딩", "utf-8"))
+        maxCells = AdminPromptLong( _
+            "한 번에 허용할 최대 전체 셀 수를 입력하세요.", _
+            "Secure Excel Transfer - 최대 셀", maxCells, 1, 10000000)
+
+        maxFileMB = AdminPromptLong( _
+            "허용할 최대 원본 파일 크기(MB)를 입력하세요.", _
+            "Secure Excel Transfer - 최대 파일 크기", maxFileMB, 1, 1024)
+
+        csvCharset = LCase$(AdminPromptText( _
+            "CSV 인코딩: utf-8, ks_c_5601-1987(CP949 계열), windows-1252", _
+            "Secure Excel Transfer - CSV 인코딩", csvCharset))
+    End If
 
     If csvCharset <> "utf-8" And _
        csvCharset <> "ks_c_5601-1987" And _
@@ -160,6 +180,10 @@ Public Sub SecureTransfer_AdminInitialize()
     Application.DisplayAlerts = False
     Application.ScreenUpdating = False
 
+    Set homeSheet = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+    homeCreated = True
+    homeSheet.Name = ADMIN_HOME_SHEET
+
     Set configSheet = ThisWorkbook.Worksheets.Add( _
         After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
     configCreated = True
@@ -170,6 +194,7 @@ Public Sub SecureTransfer_AdminInitialize()
     auditCreated = True
     auditSheet.Name = ADMIN_AUDIT_SHEET
 
+    AdminPrepareHomeSheet homeSheet, cfg
     AdminWriteConfiguration configSheet, cfg
     AdminPrepareAuditSheet auditSheet
 
@@ -184,6 +209,9 @@ Public Sub SecureTransfer_AdminInitialize()
     ThisWorkbook.Protect Password:=protectionPassword, _
                          Structure:=True, Windows:=False
     structureProtected = True
+
+    homeSheet.Activate
+    homeSheet.Range("A1").Select
 
     ThisWorkbook.Save
 
@@ -200,7 +228,7 @@ Public Sub SecureTransfer_AdminInitialize()
         "1) 이 SecureTransferAdminSetup 모듈을 VBA 프로젝트에서 제거" & vbCrLf & _
         "2) 조직 코드서명 인증서로 VBA 프로젝트 서명" & vbCrLf & _
         "3) 서명된 매크로만 허용하는 정책과 승인 폴더 ACL 적용" & vbCrLf & _
-        "4) 파일을 닫았다가 다시 열어 SecureTransfer_IsReady 실행", _
+        "4) 파일을 닫았다가 다시 열어 시작 화면의 큰 버튼 확인", _
         vbInformation, "Secure Excel Transfer - 초기화 완료"
     Exit Sub
 
@@ -213,7 +241,8 @@ Failed:
     If structureProtected Then ThisWorkbook.Unprotect Password:=protectionPassword
     If auditCreated Then auditSheet.Delete
     If configCreated Then configSheet.Delete
-    If configCreated Or auditCreated Or structureProtected Then ThisWorkbook.Save
+    If homeCreated Then homeSheet.Delete
+    If homeCreated Or configCreated Or auditCreated Or structureProtected Then ThisWorkbook.Save
     If appStateCaptured Then
         Application.DisplayAlerts = oldDisplayAlerts
         Application.ScreenUpdating = oldScreenUpdating
@@ -227,6 +256,129 @@ Failed:
     MsgBox "관리자 초기화를 완료하지 못해 생성 항목을 되돌렸습니다." & _
            vbCrLf & vbCrLf & failureDescription, _
            vbExclamation, "Secure Excel Transfer - 초기화 실패"
+End Sub
+
+Private Sub AdminPrepareHomeSheet(ByVal homeSheet As Worksheet, ByVal cfg As Object)
+    Dim targetShape As Shape
+
+    With homeSheet
+        .Cells.Clear
+        For Each targetShape In .Shapes
+            targetShape.Delete
+        Next targetShape
+
+        .Tab.Color = RGB(31, 78, 121)
+        .Columns("A").ColumnWidth = 3
+        .Columns("B").ColumnWidth = 18
+        .Columns("C:D").ColumnWidth = 22
+        .Columns("E:F").ColumnWidth = 18
+        .Columns("G").ColumnWidth = 3
+        .Rows("1:22").RowHeight = 24
+        .Rows("2:3").RowHeight = 32
+        .Rows("7:9").RowHeight = 30
+        .Range("A1:G22").Font.Name = "맑은 고딕"
+        .Range("A1:G22").Interior.Color = RGB(245, 247, 250)
+
+        .Range("B2:F3").Merge
+        .Range("B2").Value2 = "Secure Excel Transfer"
+        .Range("B2").Font.Size = 24
+        .Range("B2").Font.Bold = True
+        .Range("B2").Font.Color = RGB(31, 78, 121)
+        .Range("B2").HorizontalAlignment = xlCenter
+        .Range("B2").VerticalAlignment = xlCenter
+
+        .Range("B5:F5").Merge
+        .Range("B5").Value2 = "승인된 파일을 세 단계로 안전하게 가져옵니다."
+        .Range("B5").Font.Size = 12
+        .Range("B5").Font.Color = RGB(89, 89, 89)
+        .Range("B5").HorizontalAlignment = xlCenter
+
+        AdminAddHomeButton homeSheet, "btnSecureImport", .Range("B7:F9"), _
+            "파일 선택하고 가져오기", "SecureTransfer_ImportApprovedFile", _
+            RGB(31, 78, 121), RGB(255, 255, 255), 16
+
+        AdminAddHomeButton homeSheet, "btnQuickGuide", .Range("B10:D11"), _
+            "빠른 사용법", "SecureTransfer_ShowQuickGuide", _
+            RGB(217, 225, 242), RGB(31, 78, 121), 12
+
+        AdminAddHomeButton homeSheet, "btnApprovalStatus", .Range("E10:F11"), _
+            "승인 상태 확인", "SecureTransfer_ShowApprovalStatus", _
+            RGB(226, 239, 218), RGB(56, 87, 35), 12
+
+        .Range("B13:F13").Merge
+        .Range("B13").Value2 = "승인 및 최근 실행 정보"
+        .Range("B13").Font.Bold = True
+        .Range("B13").Font.Color = RGB(255, 255, 255)
+        .Range("B13").Interior.Color = RGB(68, 114, 196)
+        .Range("B13").HorizontalAlignment = xlCenter
+
+        .Range("C14:F14").Merge
+        .Range("C15:F15").Merge
+        .Range("C16:F16").Merge
+        .Range("C17:F17").Merge
+        .Range("C18:F18").Merge
+
+        .Range("B14").Value2 = "승인 상태"
+        .Range("B15").Value2 = "승인자/티켓"
+        .Range("B16").Value2 = "승인 만료일"
+        .Range("B17").Value2 = "승인 폴더"
+        .Range("B18").Value2 = "최근 실행"
+        .Range("B14:B18").Font.Bold = True
+        .Range("B14:B18").Interior.Color = RGB(221, 235, 247)
+
+        .Range("C14").Value2 = "APPROVED"
+        .Range("C15").Value2 = CStr(cfg("ApprovedBy"))
+        .Range("C16").Value2 = CStr(cfg("ApprovalExpiry"))
+        .Range("C17").Value2 = CStr(cfg("AllowedRoot"))
+        .Range("C18").Value2 = "아직 실행하지 않음"
+        .Range("C14:F18").Interior.Color = RGB(255, 255, 255)
+        .Range("B14:F18").Borders.LineStyle = xlContinuous
+        .Range("B14:F18").Borders.Color = RGB(217, 217, 217)
+        .Range("C14:F18").WrapText = True
+
+        .Range("B20:F20").Merge
+        .Range("B20").Value2 = _
+            "정책 또는 권한 오류가 나오면 우회하지 말고 IT 보안팀에 문의하세요."
+        .Range("B20").Font.Size = 10
+        .Range("B20").Font.Color = RGB(127, 127, 127)
+        .Range("B20").HorizontalAlignment = xlCenter
+
+        .Range("B2:F20").VerticalAlignment = xlVAlignCenter
+    End With
+End Sub
+
+Private Sub AdminAddHomeButton(ByVal homeSheet As Worksheet, _
+                               ByVal shapeName As String, _
+                               ByVal anchorRange As Range, _
+                               ByVal buttonText As String, _
+                               ByVal macroName As String, _
+                               ByVal fillColor As Long, _
+                               ByVal fontColor As Long, _
+                               ByVal fontSize As Long)
+    Dim buttonShape As Shape
+    Dim workbookName As String
+
+    workbookName = Replace(ThisWorkbook.Name, "'", "''")
+    Set buttonShape = homeSheet.Shapes.AddShape( _
+        ADMIN_SHAPE_ROUNDED_RECTANGLE, anchorRange.Left, anchorRange.Top, _
+        anchorRange.Width, anchorRange.Height)
+
+    With buttonShape
+        .Name = shapeName
+        .OnAction = "'" & workbookName & "'!" & macroName
+        .AlternativeText = buttonText
+        .Fill.ForeColor.RGB = fillColor
+        .Line.ForeColor.RGB = fillColor
+        .TextFrame.Characters.Text = buttonText
+        .TextFrame.Characters.Font.Name = "맑은 고딕"
+        .TextFrame.Characters.Font.Size = fontSize
+        .TextFrame.Characters.Font.Bold = True
+        .TextFrame.Characters.Font.Color = fontColor
+        .TextFrame.HorizontalAlignment = xlHAlignCenter
+        .TextFrame.VerticalAlignment = xlVAlignCenter
+        .Placement = xlMoveAndSize
+        .Locked = True
+    End With
 End Sub
 
 Private Sub AdminWriteConfiguration(ByVal configSheet As Worksheet, ByVal cfg As Object)

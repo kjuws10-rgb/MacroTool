@@ -7,6 +7,7 @@ Option Explicit
 
 Private Const CONFIG_SHEET As String = "_SecureTransferConfig"
 Private Const AUDIT_SHEET As String = "_SecureTransferAudit"
+Private Const HOME_SHEET As String = "Secure Transfer"
 Private Const CONFIG_SCHEMA_VERSION As String = "1"
 Private Const CONFIG_STATE_SEALED As String = "SEALED"
 Private Const CONFIG_APPROVED As String = "APPROVED"
@@ -41,6 +42,56 @@ NotReady:
     End If
 End Function
 
+Public Sub SecureTransfer_OnWorkbookOpen()
+    Dim cfg As Object
+    Dim homeSheet As Worksheet
+
+    On Error GoTo NotReady
+    Set cfg = LoadAndValidateConfig()
+    Set homeSheet = TryGetWorksheet(ThisWorkbook, HOME_SHEET)
+
+    If Not homeSheet Is Nothing Then
+        homeSheet.Activate
+        homeSheet.Range("A1").Select
+    End If
+    Exit Sub
+
+NotReady:
+    MsgBox PolicyStopMessage(Err.Description), _
+           vbExclamation, "Secure Excel Transfer - 사용 불가"
+End Sub
+
+Public Sub SecureTransfer_ShowQuickGuide()
+    MsgBox _
+        "사용법은 세 단계입니다." & vbCrLf & vbCrLf & _
+        "1. [파일 선택하고 가져오기] 버튼을 누르고 승인된 XLSX/CSV를 고릅니다." & vbCrLf & _
+        "2. XLSX라면 가져올 범위를 마우스로 드래그한 뒤 [확인]을 누릅니다." & vbCrLf & _
+        "3. 대상 문서에서 비어 있는 시작 셀 하나를 클릭한 뒤 [확인]을 누릅니다." & _
+        vbCrLf & vbCrLf & _
+        "CSV는 전체 파일을 가져오므로 2단계가 생략됩니다." & vbCrLf & _
+        "기존 값이 있는 범위에는 덮어쓰지 않습니다.", _
+        vbInformation, "Secure Excel Transfer - 빠른 사용법"
+End Sub
+
+Public Sub SecureTransfer_ShowApprovalStatus()
+    Dim cfg As Object
+
+    On Error GoTo NotReady
+    Set cfg = LoadAndValidateConfig()
+
+    MsgBox _
+        "상태: 승인됨" & vbCrLf & _
+        "승인자/티켓: " & CStr(cfg("ApprovedBy")) & vbCrLf & _
+        "승인 만료일: " & CStr(cfg("ApprovalExpiry")) & vbCrLf & _
+        "승인 폴더: " & CStr(cfg("AllowedRoot")), _
+        vbInformation, "Secure Excel Transfer - 승인 상태"
+    Exit Sub
+
+NotReady:
+    MsgBox PolicyStopMessage(Err.Description), _
+           vbExclamation, "Secure Excel Transfer - 승인 확인 실패"
+End Sub
+
 Public Sub SecureTransfer_ImportApprovedFile()
     Dim cfg As Object
     Dim allowedRoot As String
@@ -58,10 +109,11 @@ Public Sub SecureTransfer_ImportApprovedFile()
     Dim destinationSheet As Worksheet
     Dim destinationStart As Range
     Dim destinationRange As Range
-    Dim destinationSheetName As String
-    Dim destinationAddress As String
     Dim auditSheet As Worksheet
+    Dim homeSheet As Worksheet
     Dim auditRow As Long
+    Dim previousHomeResult As Variant
+    Dim homeUpdated As Boolean
     Dim writeStarted As Boolean
     Dim committed As Boolean
 
@@ -141,23 +193,9 @@ Public Sub SecureTransfer_ImportApprovedFile()
                                      importedRows, importedColumns)
     End If
 
-    destinationSheetName = PromptText( _
-        "대상 시트명을 입력하세요." & vbCrLf & vbCrLf & _
-        UserWorksheetNames(ThisWorkbook), _
-        "Secure Excel Transfer - 대상 시트", _
-        DefaultDestinationSheetName())
-
-    Set destinationSheet = GetWorksheetStrict(ThisWorkbook, destinationSheetName)
+    Set destinationStart = PickDestinationStartCell()
+    Set destinationSheet = destinationStart.Parent
     ValidateDestinationWorksheet destinationSheet
-
-    destinationAddress = PromptText( _
-        "가져온 값의 왼쪽 위 시작 셀을 입력하세요. 예: A1", _
-        "Secure Excel Transfer - 대상 시작 셀", "A1")
-
-    Set destinationStart = RangeOnWorksheet(destinationSheet, destinationAddress)
-    If destinationStart.Cells.CountLarge <> 1 Then
-        RaiseData "대상 시작 위치는 셀 하나여야 합니다."
-    End If
 
     If destinationStart.Row + importedRows - 1 > destinationSheet.Rows.Count Or _
        destinationStart.Column + importedColumns - 1 > destinationSheet.Columns.Count Then
@@ -181,6 +219,16 @@ Public Sub SecureTransfer_ImportApprovedFile()
                                  ThisWorkbook.Name, _
                                  Now, importedRows)
 
+    Set homeSheet = TryGetWorksheet(ThisWorkbook, HOME_SHEET)
+    If Not homeSheet Is Nothing Then
+        On Error Resume Next
+        previousHomeResult = homeSheet.Range("C18").Value2
+        If Err.Number = 0 Then homeUpdated = True
+        Err.Clear
+        On Error GoTo Failed
+    End If
+    UpdateHomeLastResult FileNameOnly(sourcePath), importedRows, importedColumns
+
     Application.StatusBar = "대상 문서와 감사 로그를 저장하는 중입니다..."
     ThisWorkbook.Save
     committed = True
@@ -189,6 +237,10 @@ Public Sub SecureTransfer_ImportApprovedFile()
                             oldAskToUpdateLinks, oldCalculation, oldAutomationSecurity, _
                             oldStatusBar
     appStateCaptured = False
+
+    ThisWorkbook.Activate
+    destinationSheet.Activate
+    Application.Goto destinationStart, True
 
     MsgBox Format$(importedRows, "#,##0") & "행 × " & _
            Format$(importedColumns, "#,##0") & _
@@ -206,6 +258,9 @@ Failed:
     End If
     If auditRow > 0 And Not committed Then
         auditSheet.Cells(auditRow, 1).Resize(1, 4).ClearContents
+    End If
+    If homeUpdated And Not committed Then
+        homeSheet.Range("C18").Value2 = previousHomeResult
     End If
     If (writeStarted Or auditRow > 0) And Not committed Then
         ThisWorkbook.Save
@@ -370,11 +425,7 @@ Private Function ReadApprovedXlsx(ByVal sourcePath As String, _
                                   ByRef rowCount As Long, _
                                   ByRef columnCount As Long) As Variant
     Dim sourceWorkbook As Workbook
-    Dim sourceSheet As Worksheet
     Dim sourceRange As Range
-    Dim defaultRange As Range
-    Dim sourceSheetName As String
-    Dim sourceRangeAddress As String
     Dim values As Variant
     Dim failureNumber As Long
     Dim failureDescription As String
@@ -409,21 +460,7 @@ Private Function ReadApprovedXlsx(ByVal sourcePath As String, _
         RaisePolicy "외부 데이터 연결이 포함된 .xlsx는 값 전용 사본으로 만든 후 승인을 받아야 합니다."
     End If
 
-    sourceSheetName = PromptText( _
-        "원본 시트명을 입력하세요." & vbCrLf & vbCrLf & _
-        WorkbookSheetNames(sourceWorkbook), _
-        "Secure Excel Transfer - 원본 시트", _
-        sourceWorkbook.Worksheets(1).Name)
-
-    Set sourceSheet = GetWorksheetStrict(sourceWorkbook, sourceSheetName)
-    Set defaultRange = EffectiveUsedRange(sourceSheet)
-
-    sourceRangeAddress = PromptText( _
-        "원본 범위를 입력하세요. 예: A1:H200", _
-        "Secure Excel Transfer - 원본 범위", _
-        defaultRange.Address(False, False))
-
-    Set sourceRange = RangeOnWorksheet(sourceSheet, sourceRangeAddress)
+    Set sourceRange = PickSourceRange(sourceWorkbook)
     If sourceRange.Areas.Count <> 1 Then
         RaiseData "원본 범위는 하나의 연속된 범위여야 합니다."
     End If
@@ -736,8 +773,10 @@ Private Sub ValidateDestinationWorksheet(ByVal targetSheet As Worksheet)
         RaisePolicy "대상 시트는 승인된 현재 통합문서에 있어야 합니다."
     End If
 
-    If targetSheet.Name = CONFIG_SHEET Or targetSheet.Name = AUDIT_SHEET Then
-        RaisePolicy "승인 설정 또는 감사 로그 시트에는 데이터를 쓸 수 없습니다."
+    If targetSheet.Name = CONFIG_SHEET Or _
+       targetSheet.Name = AUDIT_SHEET Or _
+       targetSheet.Name = HOME_SHEET Then
+        RaisePolicy "시작 화면, 승인 설정 또는 감사 로그 시트에는 데이터를 쓸 수 없습니다."
     End If
 
     If targetSheet.Visible <> xlSheetVisible Then
@@ -826,18 +865,87 @@ Private Function PickApprovedSourceFile(ByVal allowedRoot As String) As String
     End With
 End Function
 
-Private Function PromptText(ByVal promptText As String, _
-                            ByVal titleText As String, _
-                            ByVal defaultText As String) As String
-    Dim response As Variant
+Private Function PickSourceRange(ByVal sourceWorkbook As Workbook) As Range
+    Dim sourceSheet As Worksheet
+    Dim defaultRange As Range
+    Dim selectedRange As Range
 
-    response = Application.InputBox(promptText, titleText, defaultText, Type:=2)
-    If VarType(response) = vbBoolean And response = False Then
-        RaiseCancelled
+    Set sourceSheet = FirstVisibleWorksheet(sourceWorkbook)
+    Set defaultRange = EffectiveUsedRange(sourceSheet)
+
+    Application.ScreenUpdating = True
+    sourceWorkbook.Activate
+    sourceSheet.Activate
+    Application.Goto defaultRange, True
+
+    On Error Resume Next
+    Set selectedRange = Application.InputBox( _
+        Prompt:="가져올 범위를 마우스로 드래그한 뒤 [확인]을 누르세요." & _
+                vbCrLf & "다른 시트도 직접 클릭해서 선택할 수 있습니다.", _
+        Title:="1단계 - 원본 범위 선택", _
+        Default:=defaultRange.Address(External:=True), Type:=8)
+    Err.Clear
+    On Error GoTo 0
+    Application.ScreenUpdating = False
+
+    If selectedRange Is Nothing Then RaiseCancelled
+
+    If Not selectedRange.Parent.Parent Is sourceWorkbook Then
+        RaisePolicy "원본 범위는 선택한 승인 파일 안에서만 고를 수 있습니다."
     End If
 
-    PromptText = Trim$(CStr(response))
-    If Len(PromptText) = 0 Then RaiseData "입력값이 비어 있습니다."
+    If selectedRange.Areas.Count <> 1 Then
+        RaiseData "원본 범위는 하나의 연속된 범위여야 합니다."
+    End If
+
+    Set PickSourceRange = selectedRange
+End Function
+
+Private Function PickDestinationStartCell() As Range
+    Dim defaultSheet As Worksheet
+    Dim selectedCell As Range
+
+    Set defaultSheet = GetWorksheetStrict(ThisWorkbook, DefaultDestinationSheetName())
+
+    Application.ScreenUpdating = True
+    ThisWorkbook.Activate
+    defaultSheet.Activate
+    Application.Goto defaultSheet.Range("A1"), True
+
+    On Error Resume Next
+    Set selectedCell = Application.InputBox( _
+        Prompt:="값을 넣을 비어 있는 시작 셀 하나를 클릭한 뒤 [확인]을 누르세요." & _
+                vbCrLf & "선택한 셀을 왼쪽 위로 하여 데이터가 채워집니다.", _
+        Title:="마지막 단계 - 대상 시작 셀 선택", _
+        Default:=defaultSheet.Range("A1").Address(External:=True), Type:=8)
+    Err.Clear
+    On Error GoTo 0
+    Application.ScreenUpdating = False
+
+    If selectedCell Is Nothing Then RaiseCancelled
+
+    If Not selectedCell.Parent.Parent Is ThisWorkbook Then
+        RaisePolicy "대상 셀은 승인된 현재 통합문서 안에서만 고를 수 있습니다."
+    End If
+
+    If selectedCell.Cells.CountLarge <> 1 Then
+        RaiseData "대상 시작 위치는 셀 하나만 선택해야 합니다."
+    End If
+
+    Set PickDestinationStartCell = selectedCell.Cells(1, 1)
+End Function
+
+Private Function FirstVisibleWorksheet(ByVal workbookObject As Workbook) As Worksheet
+    Dim targetSheet As Worksheet
+
+    For Each targetSheet In workbookObject.Worksheets
+        If targetSheet.Visible = xlSheetVisible Then
+            Set FirstVisibleWorksheet = targetSheet
+            Exit Function
+        End If
+    Next targetSheet
+
+    RaiseData "원본 파일에 표시 상태의 시트가 없습니다."
 End Function
 
 Private Function DefaultDestinationSheetName() As String
@@ -848,7 +956,8 @@ Private Function DefaultDestinationSheetName() As String
             Set targetSheet = ActiveSheet
             If targetSheet.Visible = xlSheetVisible And _
                targetSheet.Name <> CONFIG_SHEET And _
-               targetSheet.Name <> AUDIT_SHEET Then
+               targetSheet.Name <> AUDIT_SHEET And _
+               targetSheet.Name <> HOME_SHEET Then
                 DefaultDestinationSheetName = targetSheet.Name
                 Exit Function
             End If
@@ -858,51 +967,14 @@ Private Function DefaultDestinationSheetName() As String
     For Each targetSheet In ThisWorkbook.Worksheets
         If targetSheet.Visible = xlSheetVisible And _
            targetSheet.Name <> CONFIG_SHEET And _
-           targetSheet.Name <> AUDIT_SHEET Then
+           targetSheet.Name <> AUDIT_SHEET And _
+           targetSheet.Name <> HOME_SHEET Then
             DefaultDestinationSheetName = targetSheet.Name
             Exit Function
         End If
     Next targetSheet
 
     RaisePolicy "사용 가능한 표시 상태의 대상 시트가 없습니다."
-End Function
-
-Private Function UserWorksheetNames(ByVal workbookObject As Workbook) As String
-    Dim targetSheet As Worksheet
-    Dim result As String
-
-    result = "사용 가능한 시트: "
-    For Each targetSheet In workbookObject.Worksheets
-        If targetSheet.Visible = xlSheetVisible And _
-           targetSheet.Name <> CONFIG_SHEET And _
-           targetSheet.Name <> AUDIT_SHEET Then
-            If Len(result) > 17 Then result = result & ", "
-            result = result & targetSheet.Name
-            If Len(result) > 700 Then
-                result = result & " ..."
-                Exit For
-            End If
-        End If
-    Next targetSheet
-
-    UserWorksheetNames = result
-End Function
-
-Private Function WorkbookSheetNames(ByVal workbookObject As Workbook) As String
-    Dim targetSheet As Worksheet
-    Dim result As String
-
-    result = "원본 시트: "
-    For Each targetSheet In workbookObject.Worksheets
-        If Len(result) > 11 Then result = result & ", "
-        result = result & targetSheet.Name
-        If Len(result) > 700 Then
-            result = result & " ..."
-            Exit For
-        End If
-    Next targetSheet
-
-    WorkbookSheetNames = result
 End Function
 
 Private Function GetWorksheetStrict(ByVal workbookObject As Workbook, _
@@ -919,30 +991,28 @@ Private Function GetWorksheetStrict(ByVal workbookObject As Workbook, _
     RaiseData "시트를 찾을 수 없습니다: " & worksheetName
 End Function
 
-Private Function RangeOnWorksheet(ByVal targetSheet As Worksheet, _
-                                  ByVal rangeAddress As String) As Range
-    Dim targetRange As Range
-
-    If InStr(1, rangeAddress, "!", vbBinaryCompare) > 0 Or _
-       InStr(1, rangeAddress, "[", vbBinaryCompare) > 0 Or _
-       InStr(1, rangeAddress, "]", vbBinaryCompare) > 0 Then
-        RaiseData "외부 시트 또는 통합문서 참조는 사용할 수 없습니다."
-    End If
-
-    On Error GoTo InvalidRange
-    Set targetRange = targetSheet.Range(rangeAddress)
+Private Function TryGetWorksheet(ByVal workbookObject As Workbook, _
+                                 ByVal worksheetName As String) As Worksheet
+    On Error Resume Next
+    Set TryGetWorksheet = workbookObject.Worksheets(worksheetName)
     On Error GoTo 0
-
-    If Not targetRange.Parent Is targetSheet Then
-        RaiseData "지정 범위가 선택한 시트에 속하지 않습니다."
-    End If
-
-    Set RangeOnWorksheet = targetRange
-    Exit Function
-
-InvalidRange:
-    RaiseData "올바르지 않은 셀 범위입니다: " & rangeAddress
 End Function
+
+Private Sub UpdateHomeLastResult(ByVal sourceFileName As String, _
+                                 ByVal importedRows As Long, _
+                                 ByVal importedColumns As Long)
+    Dim homeSheet As Worksheet
+
+    Set homeSheet = TryGetWorksheet(ThisWorkbook, HOME_SHEET)
+    If homeSheet Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    homeSheet.Range("C18").Value2 = _
+        Format$(Now, "yyyy-mm-dd hh:mm:ss") & " | " & _
+        sourceFileName & " | " & Format$(importedRows, "#,##0") & "행 × " & _
+        Format$(importedColumns, "#,##0") & "열"
+    On Error GoTo 0
+End Sub
 
 Private Function EffectiveUsedRange(ByVal targetSheet As Worksheet) As Range
     Dim lastRowCell As Range
