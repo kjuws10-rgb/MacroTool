@@ -1,0 +1,8 @@
+Option Explicit
+
+Private Sub Workbook_Open()
+    ' 정상일 때는 조용히 통과하고, 설정이 잘못되었을 때만 상세 경고를 표시합니다.
+    If Not SecureTransfer_IsReady(False) Then
+        Call SecureTransfer_IsReady(True)
+    End If
+End Sub

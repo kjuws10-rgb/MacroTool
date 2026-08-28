@@ -1,0 +1,8 @@
+# Microsoft Office lock files
+~$*
+
+# Local temporary and editor files
+*.tmp
+*.bak
+.vs/
+.vscode/
