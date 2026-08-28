@@ -1,21 +1,26 @@
 Attribute VB_Name = "SecureTransfer"
 Option Explicit
 
-' Secure, policy-bound value import for an administrator-approved workbook.
+' Secure, policy-bound value import and approved range export.
 ' This module never uses the clipboard, SendKeys, process manipulation, hooks,
 ' screen capture, OCR, temporary files, or an alternate read path after denial.
 
 Private Const CONFIG_SHEET As String = "_SecureTransferConfig"
 Private Const AUDIT_SHEET As String = "_SecureTransferAudit"
 Private Const HOME_SHEET As String = "Secure Transfer"
-Private Const CONFIG_SCHEMA_VERSION As String = "1"
+Private Const CONFIG_SCHEMA_VERSION As String = "2"
 Private Const CONFIG_STATE_SEALED As String = "SEALED"
 Private Const CONFIG_APPROVED As String = "APPROVED"
+Private Const EXPORT_DISABLED As String = "DISABLED"
+Private Const EXPORT_FORMAT_HTML As String = "HTML"
+Private Const EXPORT_FORMAT_PDF As String = "PDF"
 
 Private Const DIALOG_FILE_PICKER As Long = 3
 Private Const AUTOMATION_SECURITY_FORCE_DISABLE As Long = 3
 Private Const XLSX_FILE_FORMAT As Long = 51
 Private Const STRICT_XLSX_FILE_FORMAT As Long = 61
+Private Const AD_TYPE_TEXT As Long = 2
+Private Const AD_SAVE_CREATE_OVERWRITE As Long = 2
 
 Private Const ERR_CANCELLED_OFFSET As Long = 7101
 Private Const ERR_POLICY_OFFSET As Long = 7102
@@ -63,33 +68,54 @@ End Sub
 
 Public Sub SecureTransfer_ShowQuickGuide()
     MsgBox _
-        "사용법은 세 단계입니다." & vbCrLf & vbCrLf & _
+        "가져오기는 세 단계입니다." & vbCrLf & vbCrLf & _
         "1. [파일 선택하고 가져오기] 버튼을 누르고 승인된 XLSX/CSV를 고릅니다." & vbCrLf & _
         "2. XLSX라면 가져올 범위를 마우스로 드래그한 뒤 [확인]을 누릅니다." & vbCrLf & _
         "3. 대상 문서에서 비어 있는 시작 셀 하나를 클릭한 뒤 [확인]을 누릅니다." & _
         vbCrLf & vbCrLf & _
         "CSV는 전체 파일을 가져오므로 2단계가 생략됩니다." & vbCrLf & _
-        "기존 값이 있는 범위에는 덮어쓰지 않습니다.", _
+        "기존 값이 있는 범위에는 덮어쓰지 않습니다." & vbCrLf & vbCrLf & _
+        "내보내기는 [HTML로 내보내기] 또는 [PDF로 내보내기]를 누르고 " & _
+        "범위를 선택한 뒤 승인된 출력 폴더에 저장하면 됩니다." & vbCrLf & _
+        "내보내기 승인이 없거나 정책이 차단하면 즉시 중단합니다.", _
         vbInformation, "Secure Excel Transfer - 빠른 사용법"
 End Sub
 
 Public Sub SecureTransfer_ShowApprovalStatus()
     Dim cfg As Object
+    Dim exportSummary As String
 
     On Error GoTo NotReady
     Set cfg = LoadAndValidateConfig()
+
+    If UCase$(Trim$(CStr(cfg("ExportApprovalStatus")))) = CONFIG_APPROVED Then
+        exportSummary = _
+            "내보내기: 승인됨 (" & CStr(cfg("AllowedExportFormats")) & ")" & vbCrLf & _
+            "출력 폴더: " & CStr(cfg("AllowedExportRoot"))
+    Else
+        exportSummary = "내보내기: 승인되지 않음"
+    End If
 
     MsgBox _
         "상태: 승인됨" & vbCrLf & _
         "승인자/티켓: " & CStr(cfg("ApprovedBy")) & vbCrLf & _
         "승인 만료일: " & CStr(cfg("ApprovalExpiry")) & vbCrLf & _
-        "승인 폴더: " & CStr(cfg("AllowedRoot")), _
+        "가져오기 폴더: " & CStr(cfg("AllowedRoot")) & vbCrLf & _
+        exportSummary, _
         vbInformation, "Secure Excel Transfer - 승인 상태"
     Exit Sub
 
 NotReady:
     MsgBox PolicyStopMessage(Err.Description), _
            vbExclamation, "Secure Excel Transfer - 승인 확인 실패"
+End Sub
+
+Public Sub SecureTransfer_ExportSelectedRangeHtml()
+    SecureTransfer_ExportApprovedRange EXPORT_FORMAT_HTML
+End Sub
+
+Public Sub SecureTransfer_ExportSelectedRangePdf()
+    SecureTransfer_ExportApprovedRange EXPORT_FORMAT_PDF
 End Sub
 
 Public Sub SecureTransfer_ImportApprovedFile()
@@ -282,6 +308,201 @@ Failed:
            vbExclamation, "Secure Excel Transfer - 작업 중단"
 End Sub
 
+Private Sub SecureTransfer_ExportApprovedRange(ByVal exportFormat As String)
+    Dim cfg As Object
+    Dim allowedExportRoot As String
+    Dim outputPath As String
+    Dim sourceRange As Range
+    Dim sourceSheet As Worksheet
+    Dim exportedRows As Long
+    Dim exportedColumns As Long
+    Dim maxRows As Long
+    Dim maxColumns As Long
+    Dim maxCells As Long
+
+    Dim auditSheet As Worksheet
+    Dim homeSheet As Worksheet
+    Dim auditRow As Long
+    Dim previousHomeResult As Variant
+    Dim homeUpdated As Boolean
+    Dim outputReserved As Boolean
+    Dim committed As Boolean
+
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldAskToUpdateLinks As Boolean
+    Dim oldCalculation As XlCalculation
+    Dim oldAutomationSecurity As Long
+    Dim oldStatusBar As Variant
+    Dim appStateCaptured As Boolean
+
+    Dim fileSystem As Object
+    Dim failureNumber As Long
+    Dim failureDescription As String
+    Dim cleanupWarning As String
+
+    On Error GoTo Failed
+
+    exportFormat = UCase$(Trim$(exportFormat))
+    Set cfg = LoadAndValidateConfig()
+    EnsureExportAuthorized cfg, exportFormat
+
+    allowedExportRoot = NormalizeExistingFolder(CStr(cfg("AllowedExportRoot")))
+    maxRows = ReadPositiveLong(cfg, "MaxRows", 1, 1048576)
+    maxColumns = ReadPositiveLong(cfg, "MaxColumns", 1, 16384)
+    maxCells = ReadPositiveLong(cfg, "MaxCells", 1, 10000000)
+
+    If ThisWorkbook.ReadOnly Then
+        RaisePolicy "감사 로그를 기록할 수 있도록 대상 통합문서를 쓰기 가능 상태로 열어야 합니다."
+    End If
+
+    If Not ThisWorkbook.Saved Then
+        RaisePolicy "대상 통합문서에 저장되지 않은 변경 사항이 있습니다. 먼저 저장한 후 다시 실행하세요."
+    End If
+
+    Set sourceRange = PickExportRange()
+    Set sourceSheet = sourceRange.Parent
+    ValidateExportRange sourceRange, maxRows, maxColumns, maxCells
+    exportedRows = sourceRange.Rows.Count
+    exportedColumns = sourceRange.Columns.Count
+
+    If MsgBox( _
+        Format$(exportedRows, "#,##0") & "행 × " & _
+        Format$(exportedColumns, "#,##0") & "열의 표시값을 " & _
+        exportFormat & " 파일로 내보냅니다." & vbCrLf & vbCrLf & _
+        "출력 파일에는 원본 DRM/보호가 상속되지 않을 수 있습니다. " & _
+        "승인된 업무 목적에 맞는지 확인한 후 계속하세요.", _
+        vbExclamation + vbYesNo + vbDefaultButton2, _
+        "Secure Excel Transfer - 내보내기 확인") <> vbYes Then
+        Exit Sub
+    End If
+
+    outputPath = PickApprovedExportPath(allowedExportRoot, exportFormat)
+    If Len(outputPath) = 0 Then Exit Sub
+    outputPath = NormalizeApprovedNewOutputPath( _
+        outputPath, allowedExportRoot, LCase$(exportFormat))
+
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldAskToUpdateLinks = Application.AskToUpdateLinks
+    oldCalculation = Application.Calculation
+    oldAutomationSecurity = Application.AutomationSecurity
+    oldStatusBar = Application.StatusBar
+    appStateCaptured = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.AskToUpdateLinks = False
+    Application.Calculation = xlCalculationManual
+    Application.AutomationSecurity = AUTOMATION_SECURITY_FORCE_DISABLE
+    Application.StatusBar = "승인된 범위를 " & exportFormat & " 파일로 만드는 중입니다..."
+
+    ReserveNewOutputFile outputPath
+    outputReserved = True
+
+    If exportFormat = EXPORT_FORMAT_HTML Then
+        WriteApprovedHtml sourceRange, outputPath
+    ElseIf exportFormat = EXPORT_FORMAT_PDF Then
+        WriteApprovedPdf sourceRange, outputPath
+    Else
+        RaisePolicy "지원하지 않는 내보내기 형식입니다."
+    End If
+
+    Set fileSystem = CreateObject("Scripting.FileSystemObject")
+    If Not fileSystem.FileExists(outputPath) Then
+        RaiseData "출력 파일이 정상적으로 생성되지 않았습니다."
+    End If
+    If FileLen(outputPath) = 0 Then
+        RaiseData "출력 파일이 정상적으로 생성되지 않았습니다."
+    End If
+
+    Set auditSheet = ThisWorkbook.Worksheets(AUDIT_SHEET)
+    auditRow = AppendAuditRecord(auditSheet, _
+                                 ThisWorkbook.Name, _
+                                 FileNameOnly(outputPath), _
+                                 Now, exportedRows)
+
+    Set homeSheet = TryGetWorksheet(ThisWorkbook, HOME_SHEET)
+    If Not homeSheet Is Nothing Then
+        On Error Resume Next
+        previousHomeResult = homeSheet.Range("C18").Value2
+        If Err.Number = 0 Then homeUpdated = True
+        Err.Clear
+        On Error GoTo Failed
+    End If
+    UpdateHomeExportResult FileNameOnly(outputPath), exportFormat, _
+                           exportedRows, exportedColumns
+
+    Application.StatusBar = "감사 로그를 저장하는 중입니다..."
+    ThisWorkbook.Save
+    committed = True
+
+    RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, _
+                            oldAskToUpdateLinks, oldCalculation, oldAutomationSecurity, _
+                            oldStatusBar
+    appStateCaptured = False
+
+    ThisWorkbook.Activate
+    sourceSheet.Activate
+    Application.Goto sourceRange.Cells(1, 1), True
+
+    MsgBox exportFormat & " 내보내기를 완료했습니다." & vbCrLf & vbCrLf & _
+           "파일: " & outputPath & vbCrLf & _
+           "범위: " & Format$(exportedRows, "#,##0") & "행 × " & _
+           Format$(exportedColumns, "#,##0") & "열" & vbCrLf & _
+           "감사 로그와 대상 통합문서도 저장했습니다.", _
+           vbInformation, "Secure Excel Transfer - 내보내기 완료"
+    Exit Sub
+
+Failed:
+    failureNumber = Err.Number
+    failureDescription = Err.Description
+
+    On Error Resume Next
+    If outputReserved And Not committed Then
+        Err.Clear
+        If fileSystem Is Nothing Then Set fileSystem = CreateObject("Scripting.FileSystemObject")
+        If fileSystem.FileExists(outputPath) Then fileSystem.DeleteFile outputPath, True
+        If Err.Number <> 0 Then
+            cleanupWarning = cleanupWarning & vbCrLf & _
+                "승인 출력 폴더의 불완전한 파일을 제거하지 못했을 수 있습니다. " & _
+                "파일을 열거나 배포하지 말고 IT 보안팀에 알려 주세요."
+            Err.Clear
+        End If
+    End If
+
+    If auditRow > 0 And Not committed Then
+        auditSheet.Cells(auditRow, 1).Resize(1, 4).ClearContents
+    End If
+    If homeUpdated And Not committed Then
+        homeSheet.Range("C18").Value2 = previousHomeResult
+    End If
+    If (auditRow > 0 Or homeUpdated) And Not committed Then
+        Err.Clear
+        ThisWorkbook.Save
+        If Err.Number <> 0 Then
+            cleanupWarning = cleanupWarning & vbCrLf & _
+                "감사 로그 되돌림 상태를 저장하지 못했습니다. 통합문서를 닫지 말고 IT 보안팀에 알려 주세요."
+            Err.Clear
+        End If
+    End If
+
+    If appStateCaptured Then
+        RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, _
+                                oldAskToUpdateLinks, oldCalculation, oldAutomationSecurity, _
+                                oldStatusBar
+    End If
+    On Error GoTo 0
+
+    If failureNumber = vbObjectError + ERR_CANCELLED_OFFSET Then Exit Sub
+
+    MsgBox PolicyStopMessage(failureDescription & cleanupWarning), _
+           vbExclamation, "Secure Excel Transfer - 내보내기 중단"
+End Sub
+
 Private Function LoadAndValidateConfig() As Object
     Dim cfg As Object
     Dim configSheet As Worksheet
@@ -295,6 +516,8 @@ Private Function LoadAndValidateConfig() As Object
     Dim approvedWorkbook As String
     Dim approvalExpiry As Date
     Dim csvCharset As String
+    Dim exportApprovalStatus As String
+    Dim allowedExportFormats As String
 
     On Error GoTo InvalidConfig
 
@@ -349,6 +572,9 @@ Private Function LoadAndValidateConfig() As Object
     RequireSetting cfg, "ApprovedWorkbookFullName"
     RequireSetting cfg, "ApprovedBy"
     RequireSetting cfg, "ApprovalExpiry"
+    RequireSetting cfg, "ExportApprovalStatus"
+    RequireSetting cfg, "AllowedExportRoot"
+    RequireSetting cfg, "AllowedExportFormats"
     RequireSetting cfg, "MaxRows"
     RequireSetting cfg, "MaxColumns"
     RequireSetting cfg, "MaxCells"
@@ -375,6 +601,29 @@ Private Function LoadAndValidateConfig() As Object
     approvalExpiry = ParseIsoDate(CStr(cfg("ApprovalExpiry")))
     If approvalExpiry < Date Then
         RaisePolicy "관리자 승인 유효기간이 만료되었습니다."
+    End If
+
+    exportApprovalStatus = UCase$(Trim$(CStr(cfg("ExportApprovalStatus"))))
+    If exportApprovalStatus <> CONFIG_APPROVED And _
+       exportApprovalStatus <> EXPORT_DISABLED Then
+        RaisePolicy "내보내기 승인 상태가 올바르지 않습니다."
+    End If
+
+    If exportApprovalStatus = CONFIG_APPROVED Then
+        If Len(Trim$(CStr(cfg("AllowedExportRoot")))) = 0 Then
+            RaisePolicy "승인된 출력 폴더가 비어 있습니다."
+        End If
+        Call NormalizeExistingFolder(CStr(cfg("AllowedExportRoot")))
+
+        allowedExportFormats = NormalizeExportFormats(CStr(cfg("AllowedExportFormats")))
+        If allowedExportFormats <> UCase$(Trim$(CStr(cfg("AllowedExportFormats")))) Then
+            RaisePolicy "허용 내보내기 형식 설정이 정규 형식과 일치하지 않습니다."
+        End If
+    Else
+        If Len(Trim$(CStr(cfg("AllowedExportRoot")))) <> 0 Or _
+           Len(Trim$(CStr(cfg("AllowedExportFormats")))) <> 0 Then
+            RaisePolicy "내보내기 미승인 상태에는 출력 폴더와 형식이 비어 있어야 합니다."
+        End If
     End If
 
     Call ReadPositiveLong(cfg, "MaxRows", 1, 1048576)
@@ -748,21 +997,22 @@ Private Sub ValidateImportDimensions(ByVal rowCount As Long, _
                                      ByVal columnCount As Long, _
                                      ByVal maxRows As Long, _
                                      ByVal maxColumns As Long, _
-                                     ByVal maxCells As Long)
+                                     ByVal maxCells As Long, _
+                                     Optional ByVal operationLabel As String = "가져올")
     If rowCount < 1 Or columnCount < 1 Then
-        RaiseData "가져올 범위가 비어 있습니다."
+        RaiseData operationLabel & " 범위가 비어 있습니다."
     End If
 
     If rowCount > maxRows Then
-        RaisePolicy "가져올 행 수가 관리자가 정한 한도를 초과합니다."
+        RaisePolicy operationLabel & " 행 수가 관리자가 정한 한도를 초과합니다."
     End If
 
     If columnCount > maxColumns Then
-        RaisePolicy "가져올 열 수가 관리자가 정한 한도를 초과합니다."
+        RaisePolicy operationLabel & " 열 수가 관리자가 정한 한도를 초과합니다."
     End If
 
     If CDbl(rowCount) * CDbl(columnCount) > CDbl(maxCells) Then
-        RaisePolicy "가져올 전체 셀 수가 관리자가 정한 한도를 초과합니다."
+        RaisePolicy operationLabel & " 전체 셀 수가 관리자가 정한 한도를 초과합니다."
     End If
 End Sub
 
@@ -844,6 +1094,435 @@ Private Function AppendAuditRecord(ByVal auditSheet As Worksheet, _
     auditSheet.Cells(nextRow, 3).NumberFormat = "yyyy-mm-dd hh:mm:ss"
     auditSheet.Cells(nextRow, 4).NumberFormat = "#,##0"
     AppendAuditRecord = nextRow
+End Function
+
+Private Sub EnsureExportAuthorized(ByVal cfg As Object, ByVal exportFormat As String)
+    Dim allowedFormats As String
+
+    If exportFormat <> EXPORT_FORMAT_HTML And exportFormat <> EXPORT_FORMAT_PDF Then
+        RaisePolicy "지원하지 않는 내보내기 형식입니다."
+    End If
+
+    If UCase$(Trim$(CStr(cfg("ExportApprovalStatus")))) <> CONFIG_APPROVED Then
+        RaisePolicy "HTML/PDF 내보내기가 관리자에게 승인되지 않았습니다. " & _
+                    "IT 보안팀의 승인 또는 정책 예외가 필요합니다."
+    End If
+
+    allowedFormats = NormalizeExportFormats(CStr(cfg("AllowedExportFormats")))
+    If InStr(1, "," & allowedFormats & ",", _
+             "," & exportFormat & ",", vbBinaryCompare) = 0 Then
+        RaisePolicy exportFormat & " 형식은 관리자 승인 목록에 없습니다."
+    End If
+End Sub
+
+Private Function NormalizeExportFormats(ByVal rawFormats As String) As String
+    Dim compactFormats As String
+    Dim parts As Variant
+    Dim partIndex As Long
+    Dim hasHtml As Boolean
+    Dim hasPdf As Boolean
+
+    compactFormats = UCase$(Trim$(rawFormats))
+    compactFormats = Replace(compactFormats, " ", vbNullString)
+    compactFormats = Replace(compactFormats, vbTab, vbNullString)
+
+    If Len(compactFormats) = 0 Or _
+       InStr(1, compactFormats, vbCr, vbBinaryCompare) > 0 Or _
+       InStr(1, compactFormats, vbLf, vbBinaryCompare) > 0 Then
+        RaisePolicy "허용 내보내기 형식 설정이 비어 있거나 올바르지 않습니다."
+    End If
+
+    parts = Split(compactFormats, ",")
+    For partIndex = LBound(parts) To UBound(parts)
+        Select Case CStr(parts(partIndex))
+            Case EXPORT_FORMAT_HTML
+                If hasHtml Then RaisePolicy "허용 내보내기 형식에 HTML이 중복되었습니다."
+                hasHtml = True
+            Case EXPORT_FORMAT_PDF
+                If hasPdf Then RaisePolicy "허용 내보내기 형식에 PDF가 중복되었습니다."
+                hasPdf = True
+            Case Else
+                RaisePolicy "허용 내보내기 형식은 HTML과 PDF만 사용할 수 있습니다."
+        End Select
+    Next partIndex
+
+    If hasHtml And hasPdf Then
+        NormalizeExportFormats = EXPORT_FORMAT_HTML & "," & EXPORT_FORMAT_PDF
+    ElseIf hasHtml Then
+        NormalizeExportFormats = EXPORT_FORMAT_HTML
+    ElseIf hasPdf Then
+        NormalizeExportFormats = EXPORT_FORMAT_PDF
+    Else
+        RaisePolicy "허용된 내보내기 형식이 없습니다."
+    End If
+End Function
+
+Private Sub ValidateExportRange(ByVal sourceRange As Range, _
+                                ByVal maxRows As Long, _
+                                ByVal maxColumns As Long, _
+                                ByVal maxCells As Long)
+    Dim sourceSheet As Worksheet
+    Dim mergeState As Variant
+    Dim hiddenRowsState As Variant
+    Dim hiddenColumnsState As Variant
+
+    If sourceRange Is Nothing Then RaiseData "내보낼 범위를 선택하지 않았습니다."
+    If Not sourceRange.Parent.Parent Is ThisWorkbook Then
+        RaisePolicy "내보낼 범위는 승인된 현재 통합문서 안에 있어야 합니다."
+    End If
+    If sourceRange.Areas.Count <> 1 Then
+        RaiseData "내보낼 범위는 하나의 연속된 범위여야 합니다."
+    End If
+
+    Set sourceSheet = sourceRange.Parent
+    If sourceSheet.Name = CONFIG_SHEET Or _
+       sourceSheet.Name = AUDIT_SHEET Or _
+       sourceSheet.Name = HOME_SHEET Then
+        RaisePolicy "시작 화면, 승인 설정 또는 감사 로그 시트는 내보낼 수 없습니다."
+    End If
+    If sourceSheet.Visible <> xlSheetVisible Then
+        RaisePolicy "표시 상태의 업무 시트만 내보낼 수 있습니다."
+    End If
+    If sourceSheet.ProtectContents Then
+        RaisePolicy "보호된 시트는 자동으로 내보내지 않습니다. 보안팀이 승인한 비보호 업무 시트를 사용하세요."
+    End If
+
+    mergeState = sourceRange.MergeCells
+    If IsNull(mergeState) Then
+        RaiseData "선택 범위 일부에 병합 셀이 포함되어 있습니다."
+    ElseIf CBool(mergeState) Then
+        RaiseData "선택 범위에 병합 셀이 포함되어 있습니다."
+    End If
+
+    hiddenRowsState = sourceRange.EntireRow.Hidden
+    hiddenColumnsState = sourceRange.EntireColumn.Hidden
+    If IsNull(hiddenRowsState) Or IsNull(hiddenColumnsState) Then
+        RaisePolicy "숨겨진 행 또는 열이 섞인 범위는 내보내지 않습니다."
+    End If
+    If CBool(hiddenRowsState) Or CBool(hiddenColumnsState) Then
+        RaisePolicy "숨겨진 행 또는 열은 내보내지 않습니다. 표시된 범위만 선택하세요."
+    End If
+
+    ValidateImportDimensions sourceRange.Rows.Count, sourceRange.Columns.Count, _
+                             maxRows, maxColumns, maxCells, "내보낼"
+    If Application.CountA(sourceRange) = 0 Then
+        RaiseData "선택한 범위에 내보낼 표시값이 없습니다."
+    End If
+End Sub
+
+Private Function PickExportRange() As Range
+    Dim defaultSheet As Worksheet
+    Dim defaultRange As Range
+    Dim selectedRange As Range
+
+    Set defaultSheet = GetWorksheetStrict(ThisWorkbook, DefaultDestinationSheetName())
+    Set defaultRange = defaultSheet.Range("A1")
+
+    If ActiveWorkbook Is ThisWorkbook Then
+        If TypeName(Selection) = "Range" Then
+            If Selection.Parent Is defaultSheet And Selection.Areas.Count = 1 Then
+                Set defaultRange = Selection
+            End If
+        End If
+    End If
+
+    ThisWorkbook.Activate
+    defaultSheet.Activate
+    Application.Goto defaultRange, True
+
+    On Error Resume Next
+    Set selectedRange = Application.InputBox( _
+        Prompt:="내보낼 셀 범위를 마우스로 드래그한 뒤 [확인]을 누르세요." & _
+                vbCrLf & "한 개의 연속된 표시 범위만 선택할 수 있습니다.", _
+        Title:="내보낼 범위 선택", _
+        Default:=defaultRange.Address(External:=True), Type:=8)
+    Err.Clear
+    On Error GoTo 0
+
+    If selectedRange Is Nothing Then RaiseCancelled
+    If Not selectedRange.Parent.Parent Is ThisWorkbook Then
+        RaisePolicy "내보낼 범위는 승인된 현재 통합문서 안에서만 고를 수 있습니다."
+    End If
+
+    Set PickExportRange = selectedRange
+End Function
+
+Private Function PickApprovedExportPath(ByVal allowedExportRoot As String, _
+                                        ByVal exportFormat As String) As String
+    Dim suggestedPath As String
+    Dim fileFilter As String
+    Dim selectedPath As Variant
+
+    suggestedPath = EnsureTrailingSlash(allowedExportRoot) & _
+                    "approved_export_" & Format$(Now, "yyyymmdd_hhnnss") & "." & _
+                    LCase$(exportFormat)
+
+    If exportFormat = EXPORT_FORMAT_HTML Then
+        fileFilter = "HTML 문서 (*.html), *.html"
+    ElseIf exportFormat = EXPORT_FORMAT_PDF Then
+        fileFilter = "PDF 문서 (*.pdf), *.pdf"
+    Else
+        RaisePolicy "지원하지 않는 내보내기 형식입니다."
+    End If
+
+    selectedPath = Application.GetSaveAsFilename( _
+        InitialFileName:=suggestedPath, FileFilter:=fileFilter, _
+        FilterIndex:=1, Title:="승인된 출력 폴더에 저장")
+
+    If VarType(selectedPath) = vbBoolean Then
+        If selectedPath = False Then
+            PickApprovedExportPath = vbNullString
+            Exit Function
+        End If
+    End If
+
+    PickApprovedExportPath = CStr(selectedPath)
+End Function
+
+Private Function NormalizeApprovedNewOutputPath(ByVal outputPath As String, _
+                                                ByVal allowedExportRoot As String, _
+                                                ByVal requiredExtension As String) As String
+    Dim fileSystem As Object
+    Dim normalizedOutput As String
+    Dim normalizedParent As String
+    Dim normalizedRoot As String
+    Dim rootPrefix As String
+
+    Set fileSystem = CreateObject("Scripting.FileSystemObject")
+    normalizedOutput = fileSystem.GetAbsolutePathName(Trim$(outputPath))
+
+    If LCase$(fileSystem.GetExtensionName(normalizedOutput)) <> _
+       LCase$(requiredExtension) Then
+        RaisePolicy "출력 파일 확장자는 ." & LCase$(requiredExtension) & "만 사용할 수 있습니다."
+    End If
+    If Len(fileSystem.GetFileName(normalizedOutput)) = 0 Then
+        RaisePolicy "출력 파일명이 비어 있습니다."
+    End If
+
+    normalizedParent = NormalizeExistingFolder(fileSystem.GetParentFolderName(normalizedOutput))
+    normalizedRoot = NormalizeExistingFolder(allowedExportRoot)
+    rootPrefix = EnsureTrailingSlash(normalizedRoot)
+
+    If StrComp(Left$(normalizedOutput, Len(rootPrefix)), rootPrefix, vbTextCompare) <> 0 Then
+        RaisePolicy "출력 파일이 관리자가 승인한 출력 폴더 밖에 있습니다."
+    End If
+    If fileSystem.FileExists(normalizedOutput) Then
+        RaisePolicy "기존 파일을 덮어쓰지 않습니다. 새 파일명을 입력하세요."
+    End If
+    If fileSystem.FolderExists(normalizedOutput) Then
+        RaisePolicy "출력 경로가 폴더를 가리키고 있습니다."
+    End If
+
+    NormalizeApprovedNewOutputPath = normalizedOutput
+End Function
+
+Private Sub ReserveNewOutputFile(ByVal outputPath As String)
+    Dim fileSystem As Object
+    Dim emptyFile As Object
+
+    Set fileSystem = CreateObject("Scripting.FileSystemObject")
+    Set emptyFile = fileSystem.CreateTextFile(outputPath, False, False)
+    emptyFile.Close
+End Sub
+
+Private Sub WriteApprovedHtml(ByVal sourceRange As Range, ByVal outputPath As String)
+    Dim stream As Object
+    Dim rowNumber As Long
+    Dim columnNumber As Long
+    Dim failureNumber As Long
+    Dim failureDescription As String
+
+    On Error GoTo Failed
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = AD_TYPE_TEXT
+    stream.Charset = "utf-8"
+    stream.Open
+
+    stream.WriteText "<!doctype html>" & vbCrLf
+    stream.WriteText "<html lang=""ko"">" & vbCrLf
+    stream.WriteText "<head>" & vbCrLf
+    stream.WriteText "<meta charset=""utf-8"">" & vbCrLf
+    stream.WriteText "<meta name=""viewport"" content=""width=device-width,initial-scale=1"">" & vbCrLf
+    stream.WriteText "<meta http-equiv=""Content-Security-Policy"" content=""default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"">" & vbCrLf
+    stream.WriteText "<title>승인된 Excel 데이터 내보내기</title>" & vbCrLf
+    stream.WriteText "<style>body{font-family:'Malgun Gothic',sans-serif;margin:24px;color:#1f2937;background:#fff}h1{font-size:20px;margin:0 0 8px}.meta{color:#6b7280;margin:0 0 16px}table{border-collapse:collapse;max-width:100%}td{border:1px solid #cbd5e1;padding:6px 8px;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere}tr:nth-child(even){background:#f8fafc}</style>" & vbCrLf
+    stream.WriteText "</head><body>" & vbCrLf
+    stream.WriteText "<h1>승인된 Excel 데이터 내보내기</h1>" & vbCrLf
+    stream.WriteText "<p class=""meta"">" & Format$(sourceRange.Rows.Count, "#,##0") & _
+                     "행 × " & Format$(sourceRange.Columns.Count, "#,##0") & "열</p>" & vbCrLf
+    stream.WriteText "<table aria-label=""승인된 Excel 데이터"">" & vbCrLf
+
+    For rowNumber = 1 To sourceRange.Rows.Count
+        stream.WriteText "<tr>"
+        For columnNumber = 1 To sourceRange.Columns.Count
+            stream.WriteText "<td>" & _
+                HtmlEncode(ExportCellDisplayText(sourceRange.Cells(rowNumber, columnNumber))) & _
+                "</td>"
+        Next columnNumber
+        stream.WriteText "</tr>" & vbCrLf
+    Next rowNumber
+
+    stream.WriteText "</table>" & vbCrLf
+    stream.WriteText "</body></html>" & vbCrLf
+    stream.SaveToFile outputPath, AD_SAVE_CREATE_OVERWRITE
+    stream.Close
+    Exit Sub
+
+Failed:
+    failureNumber = Err.Number
+    failureDescription = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise failureNumber, "SecureTransfer.WriteApprovedHtml", failureDescription
+End Sub
+
+Private Sub WriteApprovedPdf(ByVal sourceRange As Range, ByVal outputPath As String)
+    Dim temporaryWorkbook As Workbook
+    Dim temporarySheet As Worksheet
+    Dim temporaryRange As Range
+    Dim displayValues As Variant
+    Dim columnNumber As Long
+    Dim rowNumber As Long
+    Dim columnWidth As Double
+    Dim failureNumber As Long
+    Dim failureDescription As String
+
+    On Error GoTo Failed
+
+    displayValues = BuildExportDisplayValues(sourceRange)
+    Set temporaryWorkbook = Application.Workbooks.Add(xlWBATWorksheet)
+    Set temporarySheet = temporaryWorkbook.Worksheets(1)
+    Set temporaryRange = temporarySheet.Range("A1").Resize( _
+        sourceRange.Rows.Count, sourceRange.Columns.Count)
+
+    temporaryRange.NumberFormat = "@"
+    temporaryRange.Value2 = displayValues
+    If RangeContainsFormula(temporaryRange) Then
+        RaisePolicy "PDF 준비 과정에서 수식이 만들어져 내보내기를 중단했습니다."
+    End If
+
+    With temporaryRange
+        .Font.Name = "맑은 고딕"
+        .Font.Size = 9
+        .WrapText = True
+        .VerticalAlignment = xlVAlignTop
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(203, 213, 225)
+        .Borders.Weight = xlThin
+    End With
+
+    For columnNumber = 1 To sourceRange.Columns.Count
+        columnWidth = CDbl(sourceRange.Columns(columnNumber).ColumnWidth)
+        If columnWidth < 8 Then columnWidth = 8
+        If columnWidth > 40 Then columnWidth = 40
+        temporarySheet.Columns(columnNumber).ColumnWidth = columnWidth
+    Next columnNumber
+
+    temporaryRange.Rows.AutoFit
+    For rowNumber = 1 To temporaryRange.Rows.Count
+        If temporaryRange.Rows(rowNumber).RowHeight > 90 Then
+            temporaryRange.Rows(rowNumber).RowHeight = 90
+        End If
+    Next rowNumber
+
+    With temporarySheet.PageSetup
+        If sourceRange.Columns.Count > 8 Then
+            .Orientation = xlLandscape
+        Else
+            .Orientation = xlPortrait
+        End If
+        .Zoom = False
+        .FitToPagesWide = 1
+        .FitToPagesTall = False
+        .CenterHorizontally = True
+        .PrintArea = temporaryRange.Address
+    End With
+
+    temporarySheet.ExportAsFixedFormat _
+        Type:=xlTypePDF, Filename:=outputPath, Quality:=xlQualityStandard, _
+        IncludeDocProperties:=False, IgnorePrintAreas:=False, _
+        OpenAfterPublish:=False
+
+    temporaryWorkbook.Close SaveChanges:=False
+    Set temporaryWorkbook = Nothing
+    Exit Sub
+
+Failed:
+    failureNumber = Err.Number
+    failureDescription = Err.Description
+    On Error Resume Next
+    If Not temporaryWorkbook Is Nothing Then temporaryWorkbook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise failureNumber, "SecureTransfer.WriteApprovedPdf", failureDescription
+End Sub
+
+Private Function BuildExportDisplayValues(ByVal sourceRange As Range) As Variant
+    Dim outputValues() As Variant
+    Dim rowNumber As Long
+    Dim columnNumber As Long
+
+    ReDim outputValues(1 To sourceRange.Rows.Count, 1 To sourceRange.Columns.Count)
+    For rowNumber = 1 To sourceRange.Rows.Count
+        For columnNumber = 1 To sourceRange.Columns.Count
+            outputValues(rowNumber, columnNumber) = _
+                ExportCellDisplayText(sourceRange.Cells(rowNumber, columnNumber))
+        Next columnNumber
+    Next rowNumber
+
+    BuildExportDisplayValues = outputValues
+End Function
+
+Private Function ExportCellDisplayText(ByVal targetCell As Range) As String
+    If IsEmpty(targetCell.Value2) Then
+        ExportCellDisplayText = vbNullString
+    Else
+        ExportCellDisplayText = CStr(targetCell.Text)
+    End If
+End Function
+
+Private Function HtmlEncode(ByVal textValue As String) As String
+    Dim encodedText As String
+    Dim currentCharacter As String
+    Dim characterCode As Long
+    Dim position As Long
+
+    position = 1
+    Do While position <= Len(textValue)
+        currentCharacter = Mid$(textValue, position, 1)
+        Select Case currentCharacter
+            Case "&"
+                encodedText = encodedText & "&amp;"
+            Case "<"
+                encodedText = encodedText & "&lt;"
+            Case ">"
+                encodedText = encodedText & "&gt;"
+            Case """"
+                encodedText = encodedText & "&quot;"
+            Case "'"
+                encodedText = encodedText & "&#39;"
+            Case vbTab
+                encodedText = encodedText & "&#9;"
+            Case vbCr
+                encodedText = encodedText & "&#10;"
+                If position < Len(textValue) Then
+                    If Mid$(textValue, position + 1, 1) = vbLf Then position = position + 1
+                End If
+            Case vbLf
+                encodedText = encodedText & "&#10;"
+            Case Else
+                characterCode = AscW(currentCharacter)
+                If characterCode < 0 Then characterCode = characterCode + 65536
+                If characterCode < 32 Then
+                    encodedText = encodedText & "&#xfffd;"
+                Else
+                    encodedText = encodedText & currentCharacter
+                End If
+        End Select
+        position = position + 1
+    Loop
+
+    HtmlEncode = encodedText
 End Function
 
 Private Function PickApprovedSourceFile(ByVal allowedRoot As String) As String
@@ -1014,6 +1693,24 @@ Private Sub UpdateHomeLastResult(ByVal sourceFileName As String, _
     On Error GoTo 0
 End Sub
 
+Private Sub UpdateHomeExportResult(ByVal outputFileName As String, _
+                                   ByVal exportFormat As String, _
+                                   ByVal exportedRows As Long, _
+                                   ByVal exportedColumns As Long)
+    Dim homeSheet As Worksheet
+
+    Set homeSheet = TryGetWorksheet(ThisWorkbook, HOME_SHEET)
+    If homeSheet Is Nothing Then Exit Sub
+
+    On Error Resume Next
+    homeSheet.Range("C18").Value2 = _
+        Format$(Now, "yyyy-mm-dd hh:mm:ss") & " | " & _
+        exportFormat & " 내보내기 | " & outputFileName & " | " & _
+        Format$(exportedRows, "#,##0") & "행 × " & _
+        Format$(exportedColumns, "#,##0") & "열"
+    On Error GoTo 0
+End Sub
+
 Private Function EffectiveUsedRange(ByVal targetSheet As Worksheet) As Range
     Dim lastRowCell As Range
     Dim lastColumnCell As Range
@@ -1047,7 +1744,7 @@ Private Sub RejectIfOfficeRightsManaged(ByVal workbookObject As Workbook, _
 
     If rightsManagementEnabled Then
         RaisePolicy roleDescription & _
-                    "에 Microsoft 권한 관리가 적용되어 있어 자동 가져오기를 수행하지 않습니다."
+                    "에 Microsoft 권한 관리가 적용되어 있어 자동 가져오기 또는 내보내기를 수행하지 않습니다."
     End If
     Exit Sub
 
@@ -1175,6 +1872,9 @@ Private Function CanonicalConfig(ByVal cfg As Object) As String
         "ApprovedWorkbookFullName=" & CStr(cfg("ApprovedWorkbookFullName")) & vbLf & _
         "ApprovedBy=" & CStr(cfg("ApprovedBy")) & vbLf & _
         "ApprovalExpiry=" & CStr(cfg("ApprovalExpiry")) & vbLf & _
+        "ExportApprovalStatus=" & CStr(cfg("ExportApprovalStatus")) & vbLf & _
+        "AllowedExportRoot=" & CStr(cfg("AllowedExportRoot")) & vbLf & _
+        "AllowedExportFormats=" & CStr(cfg("AllowedExportFormats")) & vbLf & _
         "MaxRows=" & CStr(cfg("MaxRows")) & vbLf & _
         "MaxColumns=" & CStr(cfg("MaxColumns")) & vbLf & _
         "MaxCells=" & CStr(cfg("MaxCells")) & vbLf & _
